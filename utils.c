@@ -8,6 +8,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#include <time.h>
+#include <pthread.h>
 #include "torchlight.h"
 
 // String utility functions
@@ -121,4 +123,203 @@ int torchlight_url_encode(const char* input, char* output, size_t output_size) {
     size_t dst_remaining = output_size - 1;
     
     while (*src && dst_remaining >= 4) {  // Need space for %XX plus null terminator
-        if (isalnum(*src) || strchr(\"-_.~\", *src)) {\n            // Safe character\n            *dst++ = *src;\n            dst_remaining--;\n        } else {\n            // Encode character\n            snprintf(dst, 4, \"%%%-2X\", (unsigned char)*src);\n            dst += 3;\n            dst_remaining -= 3;\n        }\n        src++;\n    }\n    \n    *dst = '\\0';\n    return 0;\n}\n\n// HTML escaping\n\nint torchlight_html_escape(const char* input, char* output, size_t output_size) {\n    if (!input || !output || output_size == 0) return -1;\n    \n    const char* src = input;\n    char* dst = output;\n    size_t dst_remaining = output_size - 1;\n    \n    while (*src && dst_remaining > 6) {  // Longest escape is &quot; (6 chars)\n        const char* escape = NULL;\n        \n        switch (*src) {\n            case '<': escape = \"&lt;\"; break;\n            case '>': escape = \"&gt;\"; break;\n            case '&': escape = \"&amp;\"; break;\n            case '\"': escape = \"&quot;\"; break;\n            case '\\'': escape = \"&#39;\"; break;\n            default:\n                *dst++ = *src;\n                dst_remaining--;\n                break;\n        }\n        \n        if (escape) {\n            size_t escape_len = strlen(escape);\n            if (escape_len <= dst_remaining) {\n                strcpy(dst, escape);\n                dst += escape_len;\n                dst_remaining -= escape_len;\n            } else {\n                break;  // Not enough space\n            }\n        }\n        \n        src++;\n    }\n    \n    *dst = '\\0';\n    return 0;\n}\n\n// File utility functions\n\nbool torchlight_file_exists(const char* path) {\n    if (!path) return false;\n    \n    struct stat st;\n    return stat(path, &st) == 0 && S_ISREG(st.st_mode);\n}\n\nint torchlight_read_file(const char* path, char** content, size_t* size) {\n    if (!path || !content) return -1;\n    \n    FILE* file = fopen(path, \"rb\");\n    if (!file) return -1;\n    \n    // Get file size\n    fseek(file, 0, SEEK_END);\n    long file_size = ftell(file);\n    fseek(file, 0, SEEK_SET);\n    \n    if (file_size <= 0) {\n        fclose(file);\n        return -1;\n    }\n    \n    // Allocate buffer\n    *content = malloc(file_size + 1);\n    if (!*content) {\n        fclose(file);\n        return -1;\n    }\n    \n    // Read file\n    size_t bytes_read = fread(*content, 1, file_size, file);\n    fclose(file);\n    \n    if (bytes_read != (size_t)file_size) {\n        free(*content);\n        *content = NULL;\n        return -1;\n    }\n    \n    (*content)[file_size] = '\\0';\n    if (size) *size = file_size;\n    \n    return 0;\n}\n\n// Session management utilities\n\nstatic session_t g_sessions[TORCHLIGHT_MAX_SESSIONS] = {0};\nstatic int g_session_count = 0;\nstatic pthread_mutex_t g_session_mutex = PTHREAD_MUTEX_INITIALIZER;\n\n// Generate random session ID\nstatic void generate_session_id(char* session_id_out) {\n    const char* chars = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\";\n    \n    for (int i = 0; i < 63; i++) {\n        session_id_out[i] = chars[rand() % 62];\n    }\n    session_id_out[63] = '\\0';\n}\n\nint torchlight_create_session(const char* user_id, char* session_id_out) {\n    pthread_mutex_lock(&g_session_mutex);\n    \n    if (g_session_count >= TORCHLIGHT_MAX_SESSIONS) {\n        pthread_mutex_unlock(&g_session_mutex);\n        return -1;  // Too many sessions\n    }\n    \n    session_t* session = &g_sessions[g_session_count];\n    \n    generate_session_id(session->session_id);\n    if (user_id) {\n        strncpy(session->user_id, user_id, sizeof(session->user_id) - 1);\n    }\n    \n    session->created_time = time(NULL);\n    session->last_access_time = session->created_time;\n    session->authenticated = (user_id != NULL);\n    session->data[0] = '\\0';\n    \n    strcpy(session_id_out, session->session_id);\n    g_session_count++;\n    \n    pthread_mutex_unlock(&g_session_mutex);\n    return 0;\n}\n\nsession_t* torchlight_get_session(const char* session_id) {\n    if (!session_id) return NULL;\n    \n    pthread_mutex_lock(&g_session_mutex);\n    \n    for (int i = 0; i < g_session_count; i++) {\n        if (strcmp(g_sessions[i].session_id, session_id) == 0) {\n            g_sessions[i].last_access_time = time(NULL);\n            pthread_mutex_unlock(&g_session_mutex);\n            return &g_sessions[i];\n        }\n    }\n    \n    pthread_mutex_unlock(&g_session_mutex);\n    return NULL;\n}\n\nint torchlight_update_session(const char* session_id, const char* data) {\n    if (!session_id || !data) return -1;\n    \n    session_t* session = torchlight_get_session(session_id);\n    if (!session) return -1;\n    \n    pthread_mutex_lock(&g_session_mutex);\n    strncpy(session->data, data, sizeof(session->data) - 1);\n    session->data[sizeof(session->data) - 1] = '\\0';\n    pthread_mutex_unlock(&g_session_mutex);\n    \n    return 0;\n}\n\nint torchlight_destroy_session(const char* session_id) {\n    if (!session_id) return -1;\n    \n    pthread_mutex_lock(&g_session_mutex);\n    \n    for (int i = 0; i < g_session_count; i++) {\n        if (strcmp(g_sessions[i].session_id, session_id) == 0) {\n            // Shift remaining sessions down\n            for (int j = i; j < g_session_count - 1; j++) {\n                g_sessions[j] = g_sessions[j + 1];\n            }\n            g_session_count--;\n            pthread_mutex_unlock(&g_session_mutex);\n            return 0;\n        }\n    }\n    \n    pthread_mutex_unlock(&g_session_mutex);\n    return -1;  // Session not found\n}\n\nint torchlight_cleanup_sessions(void) {\n    time_t now = time(NULL);\n    int cleaned = 0;\n    \n    pthread_mutex_lock(&g_session_mutex);\n    \n    for (int i = g_session_count - 1; i >= 0; i--) {\n        if (now - g_sessions[i].last_access_time > TORCHLIGHT_SESSION_TIMEOUT) {\n            // Remove expired session\n            for (int j = i; j < g_session_count - 1; j++) {\n                g_sessions[j] = g_sessions[j + 1];\n            }\n            g_session_count--;\n            cleaned++;\n        }\n    }\n    \n    pthread_mutex_unlock(&g_session_mutex);\n    return cleaned;\n}\n\n// Security functions\n\nint torchlight_generate_csrf_token(char* token_out, size_t token_size) {\n    if (!token_out || token_size < 33) return -1;  // Need at least 32 chars + null\n    \n    const char* chars = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\";\n    \n    for (size_t i = 0; i < token_size - 1; i++) {\n        token_out[i] = chars[rand() % 62];\n    }\n    token_out[token_size - 1] = '\\0';\n    \n    return 0;\n}\n\nbool torchlight_validate_csrf_token(const http_request_t* request, const char* expected_token) {\n    if (!request || !expected_token) return false;\n    \n    const char* token = torchlight_get_header(request, \"X-CSRF-Token\");\n    if (!token) {\n        // Check form data for token\n        token = torchlight_get_query_param(request, \"csrf_token\");\n    }\n    \n    return token && strcmp(token, expected_token) == 0;\n}\n\nstatic time_t g_last_request_times[256] = {0};  // Simple rate limiting\nstatic int g_request_counts[256] = {0};\n\nbool torchlight_check_rate_limit(const char* client_id) {\n    if (!client_id) return false;\n    \n    // Simple hash of client ID\n    unsigned char hash = 0;\n    for (const char* p = client_id; *p; p++) {\n        hash ^= *p;\n    }\n    \n    time_t now = time(NULL);\n    \n    // Reset counter if minute has passed\n    if (now - g_last_request_times[hash] >= 60) {\n        g_request_counts[hash] = 0;\n        g_last_request_times[hash] = now;\n    }\n    \n    g_request_counts[hash]++;\n    \n    // Allow up to 60 requests per minute by default\n    return g_request_counts[hash] <= 60;\n}\n\nint torchlight_add_security_headers(http_response_t* response) {\n    if (!response) return -1;\n    \n    torchlight_add_header(response, \"X-Content-Type-Options\", \"nosniff\");\n    torchlight_add_header(response, \"X-Frame-Options\", \"DENY\");\n    torchlight_add_header(response, \"X-XSS-Protection\", \"1; mode=block\");\n    torchlight_add_header(response, \"Referrer-Policy\", \"strict-origin-when-cross-origin\");\n    \n    return 0;\n}"
+        if (isalnum(*src) || strchr("-_.~", *src)) {
+            // Safe character
+            *dst++ = *src;
+            dst_remaining--;
+        } else {
+            // Encode character
+            snprintf(dst, 4, "%%%02X", (unsigned char)*src);
+            dst += 3;
+            dst_remaining -= 3;
+        }
+        src++;
+    }
+    
+    *dst = '\0';
+    return 0;
+}
+
+// HTML escaping
+
+int torchlight_html_escape(const char* input, char* output, size_t output_size) {
+    if (!input || !output || output_size == 0) return -1;
+    
+    const char* src = input;
+    char* dst = output;
+    size_t dst_remaining = output_size - 1;
+    
+    while (*src && dst_remaining > 6) {  // Longest escape is &quot; (6 chars)
+        const char* escape = NULL;
+        
+        switch (*src) {
+            case '<': escape = "&lt;"; break;
+            case '>': escape = "&gt;"; break;
+            case '&': escape = "&amp;"; break;
+            case '"': escape = "&quot;"; break;
+            case '\'': escape = "&#39;"; break;
+            default:
+                *dst++ = *src;
+                dst_remaining--;
+                break;
+        }
+        
+        if (escape) {
+            size_t escape_len = strlen(escape);
+            if (escape_len <= dst_remaining) {
+                strcpy(dst, escape);
+                dst += escape_len;
+                dst_remaining -= escape_len;
+            } else {
+                break;  // Not enough space
+            }
+        }
+        
+        src++;
+    }
+    
+    *dst = '\0';
+    return 0;
+}
+
+// File utility functions
+
+bool torchlight_file_exists(const char* path) {
+    if (!path) return false;
+    
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+int torchlight_read_file(const char* path, char** content, size_t* size) {
+    if (!path || !content) return -1;
+    
+    FILE* file = fopen(path, "rb");
+    if (!file) return -1;
+    
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    if (file_size <= 0) {
+        fclose(file);
+        return -1;
+    }
+    
+    // Allocate buffer
+    *content = malloc(file_size + 1);
+    if (!*content) {
+        fclose(file);
+        return -1;
+    }
+    
+    // Read file
+    size_t bytes_read = fread(*content, 1, file_size, file);
+    fclose(file);
+    
+    if (bytes_read != (size_t)file_size) {
+        free(*content);
+        *content = NULL;
+        return -1;
+    }
+    
+    (*content)[file_size] = '\0';
+    if (size) *size = file_size;
+    
+    return 0;
+}
+
+// Session management utilities
+
+static session_t g_sessions[TORCHLIGHT_MAX_SESSIONS] = {0};
+static int g_session_count = 0;
+static pthread_mutex_t g_session_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Generate random session ID
+static void generate_session_id(char* session_id_out) {
+    const char* chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    
+    for (int i = 0; i < 63; i++) {
+        session_id_out[i] = chars[rand() % 62];
+    }
+    session_id_out[63] = '\0';
+}
+
+int torchlight_create_session(const char* user_id, char* session_id_out) {
+    pthread_mutex_lock(&g_session_mutex);
+    
+    if (g_session_count >= TORCHLIGHT_MAX_SESSIONS) {
+        pthread_mutex_unlock(&g_session_mutex);
+        return -1;  // Too many sessions
+    }
+    
+    session_t* session = &g_sessions[g_session_count];
+    
+    generate_session_id(session->session_id);
+    if (user_id) {
+        strncpy(session->user_id, user_id, sizeof(session->user_id) - 1);
+    }
+    
+    session->created_time = time(NULL);
+    session->last_access_time = session->created_time;
+    session->authenticated = (user_id != NULL);
+    session->data[0] = '\0';
+    
+    strcpy(session_id_out, session->session_id);
+    g_session_count++;
+    
+    pthread_mutex_unlock(&g_session_mutex);
+    return 0;
+}
+
+session_t* torchlight_get_session(const char* session_id) {
+    if (!session_id) return NULL;
+    
+    pthread_mutex_lock(&g_session_mutex);
+    
+    for (int i = 0; i < g_session_count; i++) {
+        if (strcmp(g_sessions[i].session_id, session_id) == 0) {
+            g_sessions[i].last_access_time = time(NULL);
+            pthread_mutex_unlock(&g_session_mutex);
+            return &g_sessions[i];
+        }
+    }
+    
+    pthread_mutex_unlock(&g_session_mutex);
+    return NULL;
+}
+
+int torchlight_cleanup_sessions(void) {
+    time_t now = time(NULL);
+    int cleaned = 0;
+    
+    pthread_mutex_lock(&g_session_mutex);
+    
+    for (int i = g_session_count - 1; i >= 0; i--) {
+        if (now - g_sessions[i].last_access_time > TORCHLIGHT_SESSION_TIMEOUT) {
+            // Remove expired session
+            for (int j = i; j < g_session_count - 1; j++) {
+                g_sessions[j] = g_sessions[j + 1];
+            }
+            g_session_count--;
+            cleaned++;
+        }
+    }
+    
+    pthread_mutex_unlock(&g_session_mutex);
+    return cleaned;
+}
+
+// Security functions
+
+int torchlight_add_security_headers(http_response_t* response) {
+    if (!response) return -1;
+    
+    torchlight_add_header(response, "X-Content-Type-Options", "nosniff");
+    torchlight_add_header(response, "X-Frame-Options", "DENY");
+    torchlight_add_header(response, "X-XSS-Protection", "1; mode=block");
+    torchlight_add_header(response, "Referrer-Policy", "strict-origin-when-cross-origin");
+    
+    return 0;
+}
